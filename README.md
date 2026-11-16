@@ -21,6 +21,27 @@ SQL 파서와 실행기를 CLI와 FastAPI에서 공유하며, 직접 구현한 �
 
 # ⁉️ 사용법
 
+## 임베디드 라이브러리
+
+`from mini_dbms import Catalog, Executor, Insert, Select, Selected, DBError`가
+공개 진입점입니다. `parse`, `split_statements`와 구체적인 DB 오류도 내보냅니다.
+이 import는 HTTP 앱이나 CLI를 시작하지 않으며 외부 패키지를 요구하지 않습니다.
+정수 열은 Python 공개 API에서도 `bool`을 받지 않습니다. 잘못된 타입은 파일 쓰기 전에 거부합니다.
+테이블 스키마와 파일 준비는 소비 앱의 책임이고, 실행기는 예매·좌석을 모릅니다.
+`Catalog.get()`이 반환하는 상태의 인덱스·락을 소비 앱에서 변경하지 마세요.
+
+```python
+from pathlib import Path
+from mini_dbms import Catalog, Executor, Insert, Select
+
+executor = Executor(Catalog(Path("tables")))
+executor.execute(Insert("students", values=[42, "민수", 20]))
+result = executor.execute(Select("students", where=("id", 42)))
+```
+
+`tests/test_public_api.py`는 다른 도메인의 CSV로 공개 API를 호출하며, 별도
+디렉터리와 외부 패키지가 없는 Python 실행에서도 삽입·중복 거부·재시작 조회를 검증합니다.
+
 ## CLI
 
 > **다음 명령어를 실행하여 SQL 파일을 입력합니다.**
