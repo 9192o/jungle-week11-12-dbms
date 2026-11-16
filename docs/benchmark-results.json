@@ -1,0 +1,35 @@
+{
+  "rows": 1000000,
+  "repeats": 3,
+  "seed": 20261116,
+  "file_bytes": 27666909,
+  "preparation_seconds": 15.046550888306228,
+  "insertion_seconds": 30.693027759589313,
+  "index_build_seconds": 5.311214450004627,
+  "output_seconds": 0.00007535350232501514,
+  "results_equal": true,
+  "queries": {
+    "front": {
+      "indexed_seconds": 0.00022439700114773586,
+      "linear_id_seconds": 3.6873257480037864,
+      "linear_field_seconds": 3.7634907869942253
+    },
+    "middle": {
+      "indexed_seconds": 0.00018312899919692427,
+      "linear_id_seconds": 3.4734068179968745,
+      "linear_field_seconds": 3.601771166002436
+    },
+    "end": {
+      "indexed_seconds": 0.00013379300071392208,
+      "linear_id_seconds": 3.4620116160003818,
+      "linear_field_seconds": 3.4971024529950228
+    },
+    "missing": {
+      "indexed_seconds": 0.00007121999806258827,
+      "linear_id_seconds": 3.3186664509994444,
+      "linear_field_seconds": 3.739657129997795
+    }
+  },
+  "environment": "Python 3.14.4 / Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+  "cache_conditions": "OS cache not cleared; repeated queries after index rebuild; includes file I/O and decoding; output is CSV serialization and flush to a temporary UTF-8 file, not terminal rendering; preparation includes SQL generation and parsing; preparation and INSERT excluded from query times"
+}
