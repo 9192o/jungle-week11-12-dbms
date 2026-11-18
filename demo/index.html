@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>위키백과 조회 성능 비교</title>
+<style>
+  :root{font-family:Inter,"Malgun Gothic",sans-serif;color:#172b2d;background:#edf2f0;--muted:#526665;--line:#dce6e0;--a:#ad582d;--b:#137b68;--c:#5b52b5}
+  *{box-sizing:border-box}body{margin:0}header{background:#102d31;color:white;padding:40px max(22px,calc((100% - 1080px)/2));border-bottom:4px solid #a3e6be}h1{font-size:clamp(29px,5vw,50px);letter-spacing:-.06em;margin:0 0 12px}p{line-height:1.55}header p{color:#c4d9d7;margin:0}main{max-width:1124px;margin:auto;padding:24px 22px;display:grid;gap:20px}.panel{background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px}.heading{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}h2{font-size:clamp(18px,3vw,24px);letter-spacing:-.04em;margin:0}button{font:inherit;color:#fff;background:#176450;border:none;border-radius:9px;padding:10px 15px;cursor:pointer}button:disabled{opacity:.5;cursor:default}.meta,.status{color:var(--muted);font-size:14px;margin:8px 0}.status{min-height:22px;margin-top:14px}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px;text-align:left;table-layout:fixed;min-width:520px}th,td{padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:middle}th:first-child{width:36%}.label{overflow-wrap:anywhere}.label small{display:block;color:var(--muted);margin-top:4px}.metric{font-variant-numeric:tabular-nums;white-space:nowrap;display:block;margin-bottom:5px}.track{height:5px;background:#e9eeeb;border-radius:10px}.bar{display:block;height:100%;border-radius:10px}.a{background:var(--a)}.b{background:var(--b)}.c{background:var(--c)}.bad{color:#a82727}.palette-a{color:var(--a)}.palette-b{color:var(--b)}.palette-c{color:var(--c)}@media(max-width:600px){header{padding:29px 18px}main{padding:15px 12px}.panel{padding:15px}button{font-size:14px}}
+</style>
+<style>
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--muted);margin:14px 0 6px}.legend span{display:flex;align-items:center;gap:7px}.legend i{display:block;width:15px;height:4px;border-radius:8px;background:currentColor}.chart{width:100%;height:275px;display:block}.chart-note{min-height:20px;margin:5px 0;color:var(--muted);font-size:13px}.cache-summary{font-size:13px;color:var(--muted);min-height:20px;margin:3px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>위키백과 조회 성능 비교</h1>
+  <p id="connection" role="status">로컬 API에 연결 중입니다.</p>
+</header>
+<main>
+  <section class="panel">
+    <div class="heading">
+      <h2>파일 선형 탐색 vs B+ Tree DBMS</h2>
+      <button id="scan" disabled>문서 5건 비교</button>
+    </div>
+    <p class="meta">CSV의 처음부터 끝까지 고르게 고른 서로 다른 ID 5개를 각 방식으로 한 번씩 조회합니다. 막대는 로그 눈금입니다.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>문서 ID</th><th class="palette-a">파일 선형 탐색</th><th class="palette-b">B+ Tree DBMS</th></tr></thead>
+      <tbody id="scan-rows"></tbody>
+    </table></div>
+    <p id="scan-status" class="status" role="status"></p>
+  </section>
+  <section class="panel">
+    <div class="heading">
+      <h2>인기 순위 DBMS vs Redis 캐시</h2>
+      <button id="repeat" disabled>인기 순위 1,000건 비교</button>
+    </div>
+    <p class="meta" id="popular-plan">시간대별 위키백과 인기 문서 상위 20개를 동시 요청 4개로 조회합니다. 각 경로에서 1,000건을 측정합니다.</p>
+    <div class="scroll"><table>
+      <thead><tr><th>조건</th><th>전체 완료 시간</th><th>p95 응답시간</th><th>순위 집계 수</th></tr></thead>
+      <tbody id="repeat-summary"></tbody>
+    </table></div>
+    <div class="legend">
+      <span class="palette-b"><i></i>DBMS</span>
+      <span class="palette-c"><i></i>mini-Redis 캐시</span>
+    </div>
+    <canvas id="repeat-chart" class="chart" role="img" aria-label="요청 순번별 두 방식의 평균 HTTP 응답시간 그래프"></canvas>
+    <p id="chart-note" class="chart-note">점 하나는 요청 순서 기준 20건의 평균입니다. 준비 조회는 측정에서 제외합니다.</p>
+    <p id="repeat-status" class="status" role="status"></p>
+  </section>
+</main>
+<script>
+"use strict";
+const base = location.protocol === "file:" ? "http://127.0.0.1:8765" : "";
+const $ = id => document.getElementById(id);
+const format = new Intl.NumberFormat("ko-KR");
+const requestCount = 1_000, windowSize = 20, concurrency = 4;
+const rounds = Math.ceil(requestCount / windowSize);
+let ids = [], rankingSlots = [], busy = false;
+let popularPoints = [];
+let chartFrame = 0;
+const modeName = {B:"DBMS", C:"mini-Redis 캐시"};
+let loadResults = {};
+
+async function request(path, options) {
+  const response = await fetch(base + path, {cache:"no-store", ...options});
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.detail || `HTTP ${response.status}`);
+  return {body, response};
+}
+
+async function lookup(id, mode) {
+  const started = performance.now();
+  const {body, response} = await request(`/articles/${id}?mode=${mode}`);
+  const ms = performance.now() - started;
+  const cacheError = response.headers.get("X-Redis-Error");
+  if (cacheError) throw new Error(`Redis ${cacheError} 실패`);
+  return {body, ms, db:Number(response.headers.get("X-Db-Lookups")), cache:response.headers.get("X-Cache")};
+}
+
+function check(left, right) {
+  if (left.id !== right.id || left.title !== right.title) throw new Error("두 경로의 조회 결과가 다릅니다.");
+}
+
+function render(target, rows, modes, logarithmic) {
+  const values = rows.flatMap(row => modes.map(mode => row[mode]?.ms ?? 0));
+  const scale = value => logarithmic ? Math.log10(1 + value) : value;
+  const peak = scale(Math.max(1, ...values));
+  $(target).replaceChildren(...rows.map(row => {
+    const tr = document.createElement("tr");
+    const label = document.createElement("td");
+    label.className = "label";
+    label.textContent = row.label;
+    if (row.caption) {
+      const caption = document.createElement("small");
+      caption.textContent = row.caption;
+      label.append(caption);
+    }
+    tr.append(label);
+    for (const mode of modes) {
+      const cell = document.createElement("td");
+      const result = row[mode];
+      if (!result) {
+        cell.textContent = "—";
+      } else {
+        const metric = document.createElement("strong");
+        metric.className = "metric palette-" + mode.toLowerCase();
+        metric.textContent = `${result.ms.toFixed(2)} ms`;
+        const track = document.createElement("div");
+        track.className = "track";
+        const bar = document.createElement("span");
+        bar.className = "bar " + mode.toLowerCase();
+        bar.style.width = `${Math.max(1, scale(result.ms) / peak * 100)}%`;
+        track.append(bar);
+        cell.append(metric, track);
+        if (result.caption) {
+          const caption = document.createElement("small");
+          caption.textContent = result.caption;
+          cell.append(caption);
+        }
+      }
+      tr.append(cell);
+    }
+    return tr;
+  }));
+}
+
+const mean = values => values.reduce((sum, item) => sum + item.ms, 0) / values.length;
+
+function drawPopular() {
+  const canvas = $("repeat-chart");
+  const {clientWidth:width, clientHeight:height} = canvas;
+  const density = window.devicePixelRatio || 1;
+  canvas.width = width * density;
+  canvas.height = height * density;
+  const context = canvas.getContext("2d");
+  context.scale(density, density);
+  const left = 49, right = width - 16, top = 14, bottom = height - 33;
+  if (right <= left) return;
+  const largest = Math.max(1, ...popularPoints.flatMap(point => [point.B, point.C]).filter(Number.isFinite));
+  const unit = 10 ** Math.floor(Math.log10(largest / 4));
+  const step = Math.ceil(largest / (4 * unit)) * unit;
+  const x = index => left + index * (right - left) / Math.max(1, rounds - 1);
+  const y = ms => bottom - ms * (bottom - top) / (4 * step);
+  context.font = "11px Inter, sans-serif";
+  for (let i = 0; i <= 4; i++) {
+    const value = i * step;
+    context.strokeStyle = "#dce6e0";
+    context.beginPath();
+    context.moveTo(left, y(value));
+    context.lineTo(right, y(value));
+    context.stroke();
+    context.fillStyle = "#526665";
+    context.fillText(`${Number(value.toFixed(2))} ms`, 1, y(value) + 4);
+  }
+  context.textAlign = "center";
+  const labels = [1,20,40,60,80,100].map(pct => Math.max(1, Math.ceil(rounds*pct/100)));
+  for (const group of new Set(labels)) {
+    context.fillText(format.format(Math.min(requestCount,group * windowSize)), x(group - 1), bottom + 17);
+  }
+  context.textAlign = "right";
+  context.fillText("누적 요청 수", right, bottom + 31);
+  for (const [mode, color] of [["B","#137b68"],["C","#5b52b5"]]) {
+    context.strokeStyle = context.fillStyle = color;
+    context.lineWidth = 2;
+    context.beginPath();
+    let previous = -2;
+    popularPoints.forEach((point, index) => {
+      if (!Number.isFinite(point[mode])) return;
+      if (index !== previous + 1) context.moveTo(x(index), y(point[mode]));
+      else context.lineTo(x(index), y(point[mode]));
+      previous = index;
+    });
+    context.stroke();
+    popularPoints.forEach((point, index) => {
+      if (!Number.isFinite(point[mode])) return;
+      context.beginPath();
+      context.arc(x(index), y(point[mode]), 2.5, 0, Math.PI * 2);
+      context.fill();
+    });
+  }
+}
+
+$("repeat-chart").onpointermove = event => {
+  const width = $("repeat-chart").clientWidth;
+  if (!popularPoints.length || width <= 65) return;
+  const index = Math.round((event.offsetX - 49) * (rounds - 1) / (width - 65));
+  const point = popularPoints[Math.max(0, Math.min(popularPoints.length - 1, index))];
+  if (!point) return;
+  const values = [];
+  if (Number.isFinite(point.B)) values.push(`DBMS ${point.B.toFixed(2)} ms`);
+  if (Number.isFinite(point.C)) values.push(`Redis ${point.C.toFixed(2)} ms · 적중 ${format.format(point.hits)}건`);
+  $("chart-note").textContent = `요청 ${format.format(point.start)}~${format.format(point.end)} · ${values.join(" · ")}`;
+};
+$("repeat-chart").onpointerleave = () => {
+  $("chart-note").textContent = "점 하나는 요청 순서 기준 20건의 평균입니다. 준비 조회는 측정에서 제외합니다.";
+};
+new ResizeObserver(drawPopular).observe($("repeat-chart"));
+
+async function runScans() {
+  const rows = ids.map(id => ({label:`ID ${format.format(id)}`}));
+  render("scan-rows", rows, ["A","B"], true);
+  for (const [index, id] of ids.entries()) {
+    $("scan-status").textContent = `${index + 1} / ${ids.length} · ID ${format.format(id)} 조회 중`;
+    for (const mode of index % 2 ? ["B","A"] : ["A","B"]) {
+      rows[index][mode] = await lookup(id, mode);
+      rows[index].caption = rows[index][mode].body.title.replaceAll("_", " ");
+      render("scan-rows", rows, ["A","B"], true);
+    }
+    check(rows[index].A.body, rows[index].B.body);
+  }
+  $("scan-status").textContent = "완료 · 문서 5건의 두 조회 결과가 일치합니다.";
+}
+
+function renderLoadResults() {
+  $("repeat-summary").replaceChildren(...["B","C"].map(mode => {
+    const result = loadResults[mode];
+    const row = document.createElement("tr");
+    const values = [modeName[mode],
+      result ? `${result.total.toFixed(2)} ms` : "—",
+      result ? `${result.p95.toFixed(2)} ms` : "—",
+      result ? `${format.format(result.aggregations)}회` : "—"];
+    for (const text of values) {
+      const cell = document.createElement("td");
+      cell.textContent = text;
+      row.append(cell);
+    }
+    return row;
+  }));
+}
+
+function recordPoint(mode, group, samples, start, end) {
+  const point = popularPoints[group] ??= {start:start + 1, end};
+  const window = samples.slice(start, end);
+  point[mode] = mean(window);
+  if (mode === "C") point.hits = window.filter(result => result.cache === "hit").length;
+  if (!chartFrame) {
+    chartFrame = requestAnimationFrame(() => {
+      chartFrame = 0;
+      drawPopular();
+    });
+  }
+}
+
+async function lookupRanking(slot, mode) {
+  const started = performance.now();
+  const {body, response} = await request(`/demo/rankings/${slot}?mode=${mode}`);
+  return {body, ms:performance.now()-started, cache:response.headers.get("X-Cache"),
+    aggregations:Number(response.headers.get("X-Aggregations"))};
+}
+
+async function measureBatch(sequence, mode, concurrency, expected) {
+  let next = 0, completed = 0, failure;
+  const samples = new Array(sequence.length);
+  const completedByGroup = new Uint16Array(Math.ceil(sequence.length / windowSize));
+  const started = performance.now();
+  async function slot() {
+    while (!failure && next < sequence.length) {
+      const index = next++;
+      try {
+        const key = sequence[index];
+        const {body, ...measurement} = await lookupRanking(key, mode);
+        if (JSON.stringify(body) !== expected.get(key)) throw new Error("두 경로의 순위 결과가 다릅니다.");
+        samples[index] = measurement;
+        const group = Math.floor(index / windowSize);
+        const start = group * windowSize;
+        const end = Math.min(sequence.length, start + windowSize);
+        if (++completedByGroup[group] === end - start) recordPoint(mode, group, samples, start, end);
+        completed++;
+        if (completed % windowSize === 0 || completed === sequence.length) {
+          $("repeat-status").textContent = `동시 ${concurrency}개 · ${modeName[mode]} · ${format.format(completed)}/${format.format(sequence.length)}건`;
+        }
+      } catch (error) { failure = error; }
+    }
+  }
+  await Promise.all(Array.from({length:concurrency}, slot));
+  const total = performance.now() - started;
+  if (failure) throw failure;
+  const sorted = samples.map(sample => sample.ms).sort((a,b) => a-b);
+  return {samples, total, p95:sorted[Math.ceil(0.95 * sorted.length)-1],
+    aggregations:samples.reduce((sum,sample) => sum + sample.aggregations, 0)};
+}
+
+async function runPopular() {
+  loadResults = {};
+  popularPoints = [];
+  drawPopular();
+  renderLoadResults();
+  const sequence = Array.from({length:requestCount}, (_,index) => rankingSlots[index % rankingSlots.length]);
+  $("repeat-status").textContent = `동시 ${concurrency}개 · 조회 준비 중`;
+  await request("/demo/rankings/reset", {method:"POST"});
+  const expected = new Map();
+  for (const slot of rankingSlots) {
+    const baseline = await lookupRanking(slot, "B");
+    const cached = await lookupRanking(slot, "C");
+    const reference = JSON.stringify(baseline.body);
+    if (JSON.stringify(cached.body) !== reference) throw new Error("두 경로의 순위 결과가 다릅니다.");
+    expected.set(slot, reference);
+  }
+  for (const mode of ["C","B"]) {
+    $("repeat-status").textContent = `동시 ${concurrency}개 · ${modeName[mode]} 조회 중`;
+    loadResults[mode] = await measureBatch(sequence, mode, concurrency, expected);
+    renderLoadResults();
+  }
+  $("repeat-status").textContent = `완료 · 두 경로에서 각각 ${format.format(requestCount)}건을 측정했고, 순위 결과가 일치합니다.`;
+}
+
+async function run(action, status) {
+  if (busy) return;
+  busy = true;
+  $("scan").disabled = $("repeat").disabled = true;
+  $(status).classList.remove("bad");
+  try { await action(); }
+  catch(error) {
+    $(status).textContent = "실패 · " + error.message;
+    $(status).classList.add("bad");
+  } finally {
+    busy = false;
+    $("scan").disabled = false;
+    $("repeat").disabled = !rankingSlots.length;
+  }
+}
+
+$("scan").onclick = () => run(runScans, "scan-status");
+$("repeat").onclick = () => run(runPopular, "repeat-status");
+async function connect() {
+  try {
+    const {body:metadata} = await request("/demo/status", {signal:AbortSignal.timeout(4000)});
+    ids = metadata.comparison_ids;
+    rankingSlots = metadata.ranking_slots || [];
+    if (ids?.length !== 5) throw new Error("비교 데이터가 아직 준비되지 않았습니다.");
+    $("connection").textContent = `한국어 위키백과 ${format.format(metadata.rows)}개 문서 · 로컬 API 연결됨`;
+    if (!rankingSlots.length) $("popular-plan").textContent = "시간대별 Pageviews ZIP이 필요합니다.";
+    render("scan-rows", ids.map(id => ({label:`ID ${format.format(id)}`})), ["A","B"], true);
+    renderLoadResults();
+    $("scan").disabled = false;
+    $("repeat").disabled = !rankingSlots.length;
+  } catch {
+    $("connection").textContent = "로컬 서버에 연결할 수 없습니다. 이 파일이 있는 demo 폴더의 start.cmd를 실행하면 자동으로 연결됩니다.";
+    setTimeout(connect, 2000);
+  }
+}
+connect();
+</script>
+</body>
+</html>

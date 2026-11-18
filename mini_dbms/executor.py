@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 from mini_dbms.catalog import Catalog, TableState
 from mini_dbms.errors import ConstraintError, TableUnavailableError
 from mini_dbms.models import Insert, Inserted, Select, Selected
@@ -9,13 +11,14 @@ class Executor:
         self._catalog: Catalog = catalog
 
     def execute(
-        self, command: Insert | Select, *, use_index: bool = True
+        self, command: Insert | Select, *, use_index: bool = True,
+        on_csv_row: Callable[[], None] | None = None,
     ) -> Inserted | Selected:
         match command:
             case Insert():
                 return self._execute_insert(command)
             case Select():
-                return self._execute_select(command, use_index=use_index)
+                return self._execute_select(command, use_index=use_index, on_csv_row=on_csv_row)
             case _:
                 assert_never(command)
 
@@ -38,7 +41,7 @@ class Executor:
                 raise
 
     def _execute_select(
-        self, command: Select, *, use_index: bool
+        self, command: Select, *, use_index: bool, on_csv_row: Callable[[], None] | None
     ) -> Selected:
         state = self._catalog.get(command.table)
         with state.lock.read_lock():
@@ -54,7 +57,7 @@ class Executor:
                 self._ensure_columns_known(schema_names, [where_column])
                 self._ensure_type_match(state.schema, where_column, where_value)
 
-            rows = self._collect_rows(state, command, use_index, where_column, where_value)
+            rows = self._collect_rows(state, use_index, where_column, where_value, on_csv_row)
             projected = [
                 self._project(row, schema_names, output_columns) for row in rows
             ]
@@ -124,16 +127,15 @@ class Executor:
     def _collect_rows(
         self,
         state: TableState,
-        command: Select,
         use_index: bool,
         where_column: str | None,
         where_value: int | str | None,
+        on_csv_row: Callable[[], None] | None,
     ) -> list[list[int | str]]:
         schema_names = [name for name, _ in state.schema]
         rows: list[list[int | str]] = []
         if (
             use_index
-            and command.where is not None
             and where_column == "id"
             and isinstance(where_value, int)
         ):
@@ -143,14 +145,17 @@ class Executor:
                     state.path, state.schema, offset, expected_id=where_value
                 )
                 rows.append(row)
+                if on_csv_row is not None:
+                    on_csv_row()
         else:
+            index = schema_names.index(where_column) if where_column is not None else None
             for _, row in CsvStorage.scan_rows(state.path, state.schema):
-                if command.where is None:
+                if on_csv_row is not None:
+                    on_csv_row()
+                if index is None or row[index] == where_value:
                     rows.append(row)
-                else:
-                    index = schema_names.index(command.where[0])
-                    if row[index] == where_value:
-                        rows.append(row)
+                    if where_column == "id":
+                        break
         return rows
 
     def _project(
