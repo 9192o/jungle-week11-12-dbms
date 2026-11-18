@@ -1,0 +1,167 @@
+import re
+from dataclasses import dataclass
+
+
+class SqlError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Insert:
+    table: str
+    columns: tuple[str, ...] | None
+    values: tuple[int | str, ...]
+
+
+@dataclass(frozen=True)
+class Select:
+    table: str
+    columns: tuple[str, ...] | None
+    condition: tuple[str, int | str] | None
+
+
+TOKEN = re.compile(
+    r"(?P<space>\s+)|(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<int>[+-]?[0-9]+)|(?P<string>'[^'\r\n]*(?:''[^'\r\n]*)*')"
+    r"|(?P<symbol>[(),;*=])"
+)
+MAX_UINT64 = 2**64 - 1
+
+
+def parse_uint64(value):
+    digits = value.lstrip("+-").lstrip("0")
+    if len(digits) > 20 or (digits and value.startswith("-")):
+        raise ValueError("integer outside unsigned 64-bit range")
+    number = int(digits or "0")
+    if number > MAX_UINT64:
+        raise ValueError("integer outside unsigned 64-bit range")
+    return number
+
+
+def read_statements(lines):
+    parts = []
+    quoted = False
+    for line in lines:
+        start = index = 0
+        while index < len(line):
+            char = line[index]
+            index += 1
+            if char == "'":
+                if quoted and line[index:index + 1] == "'":
+                    index += 1
+                else:
+                    quoted = not quoted
+            elif char == ";" and not quoted:
+                parts.append(line[start:index])
+                statement = "".join(parts)
+                if statement[:-1].strip():
+                    yield statement
+                parts.clear()
+                start = index
+        if start < len(line):
+            parts.append(line[start:])
+
+    pending = "".join(parts)
+    if pending.strip():
+        yield pending
+
+
+def statements(source):
+    return read_statements((source,))
+
+
+def tokens(statement):
+    offset = 0
+    while offset < len(statement):
+        match = TOKEN.match(statement, offset)
+        if match is None:
+            raise SqlError(f"unexpected character {statement[offset]!r}")
+        offset = match.end()
+        if match.lastgroup != "space":
+            yield match.lastgroup, match.group()
+
+
+class Parser:
+    def __init__(self, statement):
+        self.tokens = iter(tokens(statement))
+        self.current = next(self.tokens, None)
+
+    def accept(self, spelling):
+        if self.current is None:
+            return False
+        kind, value = self.current
+        if kind not in ("name", "symbol") or value.upper() != spelling:
+            return False
+        self.current = next(self.tokens, None)
+        return True
+
+    def expect(self, spelling):
+        if not self.accept(spelling):
+            raise SqlError(f"expected {spelling}")
+
+    def name(self):
+        if self.current is None or self.current[0] != "name":
+            raise SqlError("expected a table or column name")
+        _, value = self.current
+        self.current = next(self.tokens, None)
+        return value
+
+    def literal(self):
+        if self.current is None:
+            raise SqlError("expected an integer or a string")
+        kind, value = self.current
+        if kind == "string":
+            result = value[1:-1].replace("''", "'")
+        elif kind == "int":
+            try:
+                result = parse_uint64(value)
+            except ValueError as exc:
+                raise SqlError(str(exc)) from exc
+        else:
+            raise SqlError("expected an integer or a string")
+        self.current = next(self.tokens, None)
+        return result
+
+    def list_of(self, item):
+        values = [item()]
+        while self.accept(","):
+            values.append(item())
+        return tuple(values)
+
+    def insert(self):
+        self.expect("INTO")
+        table = self.name()
+        columns = None
+        if self.accept("("):
+            columns = self.list_of(self.name)
+            self.expect(")")
+        self.expect("VALUES")
+        self.expect("(")
+        values = self.list_of(self.literal)
+        self.expect(")")
+        return Insert(table, columns, values)
+
+    def select(self):
+        columns = None if self.accept("*") else self.list_of(self.name)
+        self.expect("FROM")
+        table = self.name()
+        condition = None
+        if self.accept("WHERE"):
+            column = self.name()
+            self.expect("=")
+            condition = (column, self.literal())
+        return Select(table, columns, condition)
+
+
+def parse(statement):
+    parser = Parser(statement)
+    if parser.accept("INSERT"):
+        command = parser.insert()
+    elif parser.accept("SELECT"):
+        command = parser.select()
+    else:
+        raise SqlError("expected INSERT or SELECT")
+    parser.expect(";")
+    if parser.current is not None:
+        raise SqlError("unexpected tokens after the statement")
+    return command

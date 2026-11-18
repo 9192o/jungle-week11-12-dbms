@@ -1,0 +1,4 @@
+record_id:int,name:string,seat:int
+1,"민수, 김",12
+2,"이름에 ""따옴표""",13
+3,,14
