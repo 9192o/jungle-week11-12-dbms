@@ -187,7 +187,7 @@ class CsvStorage:
         result: list[int | str] = []
         for (name, col_type), value in zip(schema, row, strict=True):
             if col_type == "int":
-                if not isinstance(value, int):
+                if type(value) is not int:
                     raise StorageError(f"expected int in {name}, got {type(value).__name__}")
             else:
                 if not isinstance(value, str):

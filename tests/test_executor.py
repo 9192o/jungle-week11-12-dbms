@@ -28,6 +28,24 @@ class ExecutorInsertTests(unittest.TestCase):
         self.assertEqual(result, Inserted(1))
         self.assertIn("1,민수,20", self.table_path.read_text(encoding="utf-8"))
 
+    def test_boolean_cannot_corrupt_integer_columns(self) -> None:
+        before = self.table_path.read_bytes()
+        for row in ([True, "test", 20], [1, "test", False]):
+            with self.subTest(row=row):
+                with self.assertRaises(ConstraintError):
+                    self.executor.execute(Insert("students", None, row))
+                self.assertEqual(self.table_path.read_bytes(), before)
+        self.assertEqual(self.executor.execute(Insert("students", None, [1, "test", 20])), Inserted(1))
+        for column in ("id", "seat"):
+            with self.assertRaises(ConstraintError):
+                self.executor.execute(Select("students", where=(column, True)))
+
+    def test_storage_rejects_boolean_without_writing(self) -> None:
+        before = self.table_path.read_bytes()
+        with self.assertRaises(StorageError):
+            CsvStorage.append_row(self.table_path, self.catalog.get("students").schema, [True, "test", 20])
+        self.assertEqual(self.table_path.read_bytes(), before)
+
     def test_reordered_insert(self) -> None:
         result = self.executor.execute(
             Insert("students", ["name", "id", "seat"], ["영희", 3, 22])

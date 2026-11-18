@@ -94,7 +94,7 @@ class Executor:
         result: list[int | str] = []
         for (name, col_type), value in zip(schema, row, strict=True):
             if col_type == "int":
-                if not isinstance(value, int):
+                if type(value) is not int:
                     raise ConstraintError(f"{name} expects int")
             else:
                 if not isinstance(value, str):
@@ -176,7 +176,7 @@ class Executor:
         value: int | str,
     ) -> None:
         col_type = next(t for n, t in schema if n == column)
-        if col_type == "int" and not isinstance(value, int):
+        if col_type == "int" and type(value) is not int:
             raise ConstraintError(f"{column} expects int")
         if col_type == "string" and not isinstance(value, str):
             raise ConstraintError(f"{column} expects string")
