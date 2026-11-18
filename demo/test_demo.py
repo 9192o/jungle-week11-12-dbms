@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 
 from full_replay import describe, read_requests
-from server import encode, load_ranking_hours, load_traffic
+from server import encode, load_traffic, prepare_ranking_files, read_top_rankings
 from mini_dbms import Catalog, Executor, Select
 
 
@@ -19,9 +19,11 @@ class DemoTests(unittest.TestCase):
                                  "date,hour_utc,id,views\n2026-10-25,9,3,10\n"
                                  "2026-10-25,9,1,10\n2026-10-25,8,3,11\n"
                                  "2026-11-01,20,3,12\n")
-            self.assertEqual(load_ranking_hours(path), {
-                "2026-10-25T09": [(10, -3), (10, -1)], "2026-11-01T20": [(12, -3)]
-            })
+            files = prepare_ranking_files(path, Path(directory))
+            self.assertEqual(set(files), {"2026-10-25T09", "2026-11-01T20"})
+            self.assertEqual(files["2026-10-25T09"].read_bytes(), b"10,-3\n10,-1\n")
+            self.assertEqual(read_top_rankings(files["2026-10-25T09"]), [(10, -1), (10, -3)])
+            self.assertEqual(read_top_rankings(files["2026-11-01T20"]), [(12, -3)])
 
     def test_full_replay_preserves_order_and_repeated_ids(self):
         with tempfile.TemporaryDirectory() as directory:

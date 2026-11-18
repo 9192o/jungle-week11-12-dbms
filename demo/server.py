@@ -12,7 +12,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import webbrowser
 import zipfile
+from contextlib import ExitStack, closing
 from pathlib import Path
 from full_replay import FullReplay, describe
 
@@ -24,6 +26,7 @@ sys.path.insert(0, str(ROOT.parent))
 REDIS_START = """
 import asyncio
 import sys
+from contextlib import ExitStack, closing
 from pathlib import Path
 from Redis import Config, RedisServer
 
@@ -97,36 +100,64 @@ class Cache:
                 raise
 
 
-def load_inputs(directory):
-    path = directory / "articles.csv"
+def read_popularity(directory):
     with zipfile.ZipFile(directory / "pageviews.zip") as archive:
-        popular = json.loads(archive.read("pageviews/popular-pages.json"))
-        for day in popular["dates"].values():
-            raw = archive.read("pageviews/" + day["raw_file"])
-            if hashlib.sha256(raw).hexdigest() != day["raw_sha256"]:
-                raise ValueError("Pageviews file hash mismatch")
-    with path.open("rb") as file:
-        digest = hashlib.file_digest(file, "sha256").hexdigest()
-    if digest != popular["articles_csv_sha256"]:
-        raise ValueError("articles.csv and Pageviews metadata do not match")
-    # 실험 위치는 ID 숫자가 아닌 원본 CSV의 행 순서에 따라 고른다.
+        return json.loads(archive.read("pageviews/popular-pages.json"))
+
+
+def article_ids(path):
     with path.open(encoding="utf-8", newline="") as file:
         records = csv.reader(file)
         if next(records) != ["id:int", "title:string"]:
             raise ValueError("Expected id:int,title:string")
-        ids = [int(row[0]) for row in records]
-    if len(ids) < 1_000_000:
+        for row in records:
+            yield int(row[0])
+
+
+def ids_at_positions(path, positions):
+    remaining = set(positions)
+    selected = {}
+    with closing(article_ids(path)) as ids:
+        for position, key in enumerate(ids):
+            if position in remaining:
+                selected[position] = key
+                remaining.remove(position)
+                if not remaining:
+                    break
+    return [selected[position] for position in positions]
+
+
+def load_inputs(directory):
+    path = directory / "articles.csv"
+    popular = read_popularity(directory)
+    with zipfile.ZipFile(directory / "pageviews.zip") as archive:
+        for day in popular["dates"].values():
+            with archive.open("pageviews/" + day["raw_file"]) as raw:
+                if hashlib.file_digest(raw, "sha256").hexdigest() != day["raw_sha256"]:
+                    raise ValueError("Pageviews file hash mismatch")
+    with path.open("rb") as file:
+        digest = hashlib.file_digest(file, "sha256").hexdigest()
+    if digest != popular["articles_csv_sha256"]:
+        raise ValueError("articles.csv and Pageviews metadata do not match")
+
+    count = 0
+    maximum = 0
+    for count, key in enumerate(article_ids(path), 1):
+        maximum = max(maximum, key)
+    if count < 1_000_000:
         raise ValueError("At least 1,000,000 articles required")
+    positions = (0, count // 2, count - 1)
+    comparison = tuple((count - 1) * part // 4 for part in range(5))
+    keys = ids_at_positions(path, positions + comparison)
     return {
-        "rows": len(ids), "sha256": digest, "bytes": path.stat().st_size,
-        "dump_date": popular["dump_date"], "positions": [ids[i] for i in (0, len(ids)//2, len(ids)-1)],
-        "comparison_ids": [ids[(len(ids) - 1) * part // 4] for part in range(5)],
-        "missing": max(ids) + 1, "dates": popular["dates"],
-        "overlap": popular["full_candidate_overlap"]
-    }, ids
+        "rows": count, "sha256": digest, "bytes": path.stat().st_size,
+        "dump_date": popular["dump_date"], "positions": keys[:len(positions)],
+        "comparison_ids": keys[len(positions):], "missing": maximum + 1,
+        "overlap": popular["full_candidate_overlap"],
+    }
 
 
-def load_traffic(path, articles_sha256):
+def load_traffic(path, articles_sha256, *, include_requests=True):
     if not path.exists():
         return None
     with zipfile.ZipFile(path) as archive:
@@ -138,6 +169,7 @@ def load_traffic(path, articles_sha256):
     if pilot["popularity_source_sha256"] != hourly_sha256:
         raise ValueError("Hourly Pageviews CSV hash mismatch")
     requests = []
+    counts = dict.fromkeys(pilot["source_stats"], 0)
     previous = ("", -1)
     for sequence, item in enumerate(pilot["requests"], 1):
         date, hour, key = item["date"], item["hour_utc"], item["id"]
@@ -146,29 +178,46 @@ def load_traffic(path, articles_sha256):
                 or type(key) is not int or key < 1 or (date, hour) < previous):
             raise ValueError(f"Invalid traffic request at sequence {sequence}")
         previous = (date, hour)
-        requests.append({"group": date, "date": date, "hour_utc": hour, "id": key})
-    counts = {date: sum(item["date"] == date for item in requests) for date in pilot["source_stats"]}
+        counts[date] += 1
+        if include_requests:
+            requests.append({"group": date, "date": date, "hour_utc": hour, "id": key})
     if not counts or any(count != pilot["requests_per_date"] for count in counts.values()):
         raise ValueError("Traffic request count does not match metadata")
-    return {
-        "request_count": len(requests), "dates": counts, "seed": pilot["seed"],
+    summary = {
+        "request_count": sum(counts.values()), "dates": counts, "seed": pilot["seed"],
         "hourly_rows": sum(day["hour_id_rows"] for day in pilot["source_stats"].values()),
-        "hourly_sha256": hourly_sha256, "requests": requests,
+        "hourly_sha256": hourly_sha256,
     }
+    if include_requests:
+        summary["requests"] = requests
+    return summary
 
 
-def load_ranking_hours(path):
-    hours = {}
+def prepare_ranking_files(path, directory):
+    files = {}
     if not path.is_file():
-        return hours
-    with zipfile.ZipFile(path) as archive, archive.open("full-pageview-traffic/hourly-pageviews.csv") as source:
+        return files
+    with ExitStack() as stack:
+        archive = stack.enter_context(zipfile.ZipFile(path))
+        source = stack.enter_context(archive.open("full-pageview-traffic/hourly-pageviews.csv"))
         rows = csv.DictReader(io.TextIOWrapper(source, encoding="utf-8", newline=""))
+        writers = {}
         for row in rows:
             hour = int(row["hour_utc"])
-            if hour in (9, 12, 20):
-                slot = f'{row["date"]}T{hour:02d}'
-                hours.setdefault(slot, []).append((int(row["views"]), -int(row["id"])))
-    return hours
+            if hour not in (9, 12, 20):
+                continue
+            slot = f'{row["date"]}T{hour:02d}'
+            if slot not in writers:
+                files[slot] = directory / f"{len(files)}.csv"
+                handle = stack.enter_context(files[slot].open("w", encoding="utf-8", newline=""))
+                writers[slot] = csv.writer(handle, lineterminator="\n")
+            writers[slot].writerow((int(row["views"]), -int(row["id"])))
+    return files
+
+
+def read_top_rankings(path):
+    with path.open(encoding="utf-8", newline="") as handle:
+        return heapq.nlargest(20, ((int(views), int(key)) for views, key in csv.reader(handle)))
 
 
 def create_demo(directory, cache, port=8765):
@@ -180,18 +229,15 @@ def create_demo(directory, cache, port=8765):
     from mini_dbms.api import create_app
     import random
 
-    metadata, ids = load_inputs(directory)
+    metadata = load_inputs(directory)
+    articles_path = directory / "articles.csv"
+    traffic_path = directory / "full-pageview-traffic.zip"
     full_path = directory / "full-replay.csv"
     full = None
     if full_path.is_file():
         metadata["full_replay"] = describe(full_path)
         full = FullReplay(full_path, directory / "full-replay-results.ndjson", port)
-    traffic = load_traffic(directory / "full-pageview-traffic.zip", metadata["sha256"])
-    ranking_hours = load_ranking_hours(directory / "full-pageview-traffic.zip")
-    ranking_titles = {}
-    metadata["ranking_slots"] = sorted(ranking_hours)
-    if traffic is not None:
-        metadata["traffic"] = {key: value for key, value in traffic.items() if key != "requests"}
+    ranking_files = {}
     app = create_app(directory, tables={"articles": "articles.csv"})
     # 데모는 읽기 전용이므로 SQL 쓰기가 가능한 공개 경로를 노출하지 않는다.
     app.router.routes[:] = [route for route in app.router.routes if getattr(route, "path", None) != "/query"]
@@ -199,27 +245,27 @@ def create_demo(directory, cache, port=8765):
 
     @asynccontextmanager
     async def lifespan(application):
-        async with original(application):
-            index = application.state.catalog.get("articles").index
-            for day in metadata["dates"].values():
-                if any(index.find(item["id"]) is None for item in day["candidates"]):
-                    raise ValueError("Pageviews includes IDs absent from the CSV")
-            if traffic is not None and any(index.find(item["id"]) is None for item in traffic["requests"]):
-                raise ValueError("Traffic replay includes IDs absent from the CSV")
-            ranking_ids = {-key for rows in ranking_hours.values() for _, key in heapq.nlargest(20, rows)}
-            for key in ranking_ids:
-                selected = application.state.executor.execute(Select("articles", where=("id", key)))
-                ranking_titles[key] = selected.rows[0][1]
-            metadata["index_build_ms"] = application.state.catalog.index_build_seconds * 1000
-            try:
-                cache.command("PING")
-                yield
-            finally:
-                if full is not None:
-                    full.stop()
-                    if full.job is not None:
-                        await asyncio.to_thread(full.job.join, 15)
-                cache.close()
+        with tempfile.TemporaryDirectory(prefix="wiki-rankings-") as ranking_dir:
+            async with original(application):
+                index = application.state.catalog.get("articles").index
+                for day in read_popularity(directory)["dates"].values():
+                    if any(index.find(item["id"]) is None for item in day["candidates"]):
+                        raise ValueError("Pageviews includes IDs absent from the CSV")
+                ranking_files.clear()
+                ranking_files.update(prepare_ranking_files(
+                    traffic_path, Path(ranking_dir)
+                ))
+                metadata["ranking_slots"] = sorted(ranking_files)
+                metadata["index_build_ms"] = application.state.catalog.index_build_seconds * 1000
+                try:
+                    cache.command("PING")
+                    yield
+                finally:
+                    if full is not None:
+                        full.stop()
+                        if full.job is not None:
+                            await asyncio.to_thread(full.job.join, 15)
+                    cache.close()
 
     app.router.lifespan_context = lifespan
     app.add_middleware(CORSMiddleware, allow_origins=["null"], allow_methods=["GET", "POST"], allow_headers=["content-type"], expose_headers=["X-Db-Lookups","X-Csv-Lookups","X-Csv-Rows","X-Cache","X-Redis-Error","X-Aggregations"])
@@ -230,7 +276,11 @@ def create_demo(directory, cache, port=8765):
 
     @app.get("/demo/status")
     def status():
-        return metadata
+        result = {**metadata, "dates": read_popularity(directory)["dates"]}
+        traffic = load_traffic(traffic_path, metadata["sha256"], include_requests=False)
+        if traffic is not None:
+            result["traffic"] = traffic
+        return result
 
     @app.post("/demo/rankings/reset")
     def reset_rankings():
@@ -241,7 +291,7 @@ def create_demo(directory, cache, port=8765):
     def ranking(slot: str, mode: str = "B"):
         if mode not in {"B", "C"}:
             raise HTTPException(400, "Expected mode B or C")
-        if slot not in ranking_hours:
+        if slot not in ranking_files:
             raise HTTPException(404, "Ranking hour not available")
         key = f"rank:{slot}"
         if mode == "C":
@@ -251,10 +301,13 @@ def create_demo(directory, cache, port=8765):
                 raise HTTPException(503, "Redis ranking GET failed") from exc
             if result is not None:
                 return JSONResponse(result, headers={"X-Aggregations": "0", "X-Cache": "hit"})
-        # 시간대별 입력은 두 경로에서 공유한다. 직접 조회는 요청마다 순위를 계산한다.
-        top = heapq.nlargest(20, ranking_hours[slot])
-        result = [{"id": -identifier, "title": ranking_titles[-identifier], "views": views}
-                  for views, identifier in top]
+        result = []
+        for views, identifier in read_top_rankings(ranking_files[slot]):
+            key_id = -identifier
+            selected = app.state.executor.execute(Select("articles", where=("id", key_id)))
+            if not selected.rows:
+                raise HTTPException(500, "Ranking article not found in DBMS")
+            result.append({"id": key_id, "title": selected.rows[0][1], "views": views})
         if mode == "C":
             try:
                 cache.command("SET", key, json.dumps(result, ensure_ascii=False, separators=(",", ":")))
@@ -264,15 +317,16 @@ def create_demo(directory, cache, port=8765):
 
     @app.get("/demo/workload")
     def workload():
-        groups = [day["candidates"][:10] for day in metadata["dates"].values()]
-        excluded = {item["id"] for day in metadata["dates"].values() for item in day["candidates"]}
+        dates = read_popularity(directory)["dates"]
+        groups = [day["candidates"][:10] for day in dates.values()]
+        excluded = {item["id"] for day in dates.values() for item in day["candidates"]}
         rng = random.Random(42)
         requests = []
         for label, group in zip(("빈 캐시 시작", "첫 날짜 반복", "둘째 날짜 전환"),
                                 (groups[0], groups[0], groups[1]), strict=True):
-            background = rng.choice(ids)
+            background, = ids_at_positions(articles_path, (rng.randrange(metadata["rows"]),))
             while background in excluded:
-                background = rng.choice(ids)
+                background, = ids_at_positions(articles_path, (rng.randrange(metadata["rows"]),))
             excluded.add(background)
             keys = [item["id"] for item in rng.choices(group, k=4)] + [background]
             rng.shuffle(keys)
@@ -281,8 +335,12 @@ def create_demo(directory, cache, port=8765):
 
     @app.get("/demo/traffic-workload")
     def traffic_workload():
+        traffic = load_traffic(traffic_path, metadata["sha256"])
         if traffic is None:
             raise HTTPException(404, "Full Pageviews traffic is unavailable")
+        index = app.state.catalog.get("articles").index
+        if any(index.find(item["id"]) is None for item in traffic["requests"]):
+            raise HTTPException(500, "Traffic replay includes IDs absent from the CSV")
         return traffic["requests"]
 
     @app.post("/demo/full-replay")
@@ -364,12 +422,23 @@ def create_demo(directory, cache, port=8765):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--open-browser", action="store_true")
     parser.add_argument("--redis-dir", type=Path, default=ROOT.parent.parent / "mini-redis-js")
     args = parser.parse_args()
     redis_server = args.redis_dir.resolve() / "Redis.py"
     if not redis_server.is_file():
         parser.error(f"mini-redis-js main checkout not found: {redis_server}")
     import uvicorn
+
+    class DemoServer(uvicorn.Server):
+        async def startup(self, sockets=None):
+            await super().startup(sockets=sockets)
+            if self.started and args.open_browser:
+                host, port = self.servers[0].sockets[0].getsockname()[:2]
+                url = f"http://{host}:{port}/"
+                print(f"Demo ready: {url}", flush=True)
+                threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+
     with tempfile.TemporaryDirectory(prefix="wiki-mini-redis-") as redis_data:
         process = subprocess.Popen(
             [sys.executable, "-B", "-c", REDIS_START, redis_data],
@@ -381,8 +450,10 @@ def main():
                 raise RuntimeError("mini-redis-js cache process failed to start")
             cache_port = int(ready[1])
             print(f"mini-redis-js: {redis_server} on {cache_port}", flush=True)
-            uvicorn.run(create_demo(DATA, Cache(cache_port), args.port), host="127.0.0.1",
-                        port=args.port, access_log=False)
+            print("Loading demo data and building the DBMS index. The browser opens after startup.",
+                  flush=True)
+            app = create_demo(DATA, Cache(cache_port), args.port)
+            DemoServer(uvicorn.Config(app, host="127.0.0.1", port=args.port, access_log=False)).run()
         finally:
             process.terminate()
             process.wait()
